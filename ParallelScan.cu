@@ -214,42 +214,89 @@ __global__ void addBlockSumsToOutput(uint* output, uint* blockSums, uint n, int 
         }
     }
 }
+__global__ void scanBlockSumsVanilla(uint* blockSums, int numBlocks) {
+    extern __shared__ uint temp[];
+    int tid = threadIdx.x;
+    int index = blockIdx.x * blockDim.x + tid;
+
+    if (index < numBlocks) {
+        temp[tid] = blockSums[index];
+    }
+    else {
+        temp[tid] = 0;  // Important to avoid out-of-bounds access in shared memory
+    }
+    __syncthreads();
+
+    // Perform up-sweep
+    for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
+        int accessIndex = (tid + 1) * 2 * stride - 1;
+        if (accessIndex < blockDim.x) {
+            temp[accessIndex] += temp[accessIndex - stride];
+        }
+        __syncthreads();
+    }
+
+    // Down-Sweep
+    for (int stride = 1 << (31 - __clz(blockDim.x - 1)); stride > 0; stride >>= 1) {
+        int accessIndex = (tid + 1) * 2 * stride - 1;
+        if (accessIndex + stride < blockDim.x) {
+            temp[accessIndex + stride] += temp[accessIndex];
+        }
+        __syncthreads();
+    }
+
+    if (index < numBlocks) {
+        blockSums[index] = temp[tid];
+    }
+}
 
 
+// Improved recursive function with enhanced error handling
 cudaError_t recursiveScanBlockSums(uint* blockSums, int numBlocks, uint* tempBuffer = nullptr) {
     bool isRootCall = (tempBuffer == nullptr);
+    cudaError_t cudaStatus;
+
     if (isRootCall) {
-        // Allocate a large enough buffer to handle all recursive levels at the start
-        cudaError_t cudaStatus = allocateDeviceMemory(&tempBuffer, (numBlocks / 2 + 1) * sizeof(uint)); // Example size, adjust as needed
-        if (cudaStatus != cudaSuccess) return cudaStatus;
+        size_t totalBufferSize = numBlocks * sizeof(uint);
+        cudaStatus = cudaMalloc((void**)&tempBuffer, totalBufferSize);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "CUDA error: Failed to allocate temporary buffer: %s\n", cudaGetErrorString(cudaStatus));
+            return cudaStatus;
+        }
     }
 
     if (numBlocks > 1) {
-        int numBlocksNext = (numBlocks + MAX_THREADS_PER_BLOCK - 1) / MAX_THREADS_PER_BLOCK;
-        uint* blockSumsNext = tempBuffer;  // Use the pre-allocated buffer
-
         int threads = min(numBlocks, MAX_THREADS_PER_BLOCK);
         int blocks = (numBlocks + threads - 1) / threads;
+        uint* blockSumsNext = tempBuffer;
 
-        scanBlockSums << <blocks, threads, threads * sizeof(uint) >> > (blockSums, blockSumsNext, numBlocks);
-        cudaError_t cudaStatus = cudaDeviceSynchronize();
-        if (cudaStatus != cudaSuccess) return cudaStatus;
+        scanBlockSumsVanilla << <blocks, threads, threads * sizeof(uint) >> > (blockSums, numBlocks);
+        cudaStatus = cudaGetLastError();
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "CUDA Kernel error: %s\n", cudaGetErrorString(cudaStatus));
+            return cudaStatus;
+        }
 
-        cudaStatus = recursiveScanBlockSums(blockSumsNext, numBlocksNext, blockSumsNext + numBlocksNext);
-        if (cudaStatus != cudaSuccess) return cudaStatus;
-
-        cudaMemcpy(blockSums, blockSumsNext, numBlocksNext * sizeof(uint), cudaMemcpyDeviceToDevice);
         cudaStatus = cudaDeviceSynchronize();
-        if (cudaStatus != cudaSuccess) return cudaStatus;
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "CUDA synchronization error: %s\n", cudaGetErrorString(cudaStatus));
+            return cudaStatus;
+        }
+
+        int nextNumBlocks = (numBlocks + threads - 1) / threads;
+        cudaStatus = recursiveScanBlockSums(blockSumsNext, nextNumBlocks, tempBuffer + nextNumBlocks * sizeof(uint));
+        if (cudaStatus != cudaSuccess) {
+            return cudaStatus;
+        }
     }
 
     if (isRootCall) {
-        // Free the temporary buffer at the root call level
-        deallocateDeviceMemory(tempBuffer);
+        cudaFree(tempBuffer);
     }
 
     return cudaSuccess;
 }
+
 
 
 // CPU implementation of normal inclusive scan
@@ -313,8 +360,8 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
 
     // Handle block sums recursively
-    //recursiveScanBlockSums(deviceBlockSums, numBlocks, nullptr);
-    scanBlockSumsVanila << < 1, numBlocks, numBlocks * sizeof(uint) >> > (deviceBlockSums, numBlocks);
+    recursiveScanBlockSums(deviceBlockSums, numBlocks, nullptr);
+    //scanBlockSumsVanila << < 1, numBlocks, numBlocks * sizeof(uint) >> > (deviceBlockSums, numBlocks);
     cudaDeviceSynchronize();
     // Add block sums back to the output
     addBlockSumsToOutput << <numBlocks, threadsPerBlock >> > (deviceOutput, deviceBlockSums, n, numBlocks);
