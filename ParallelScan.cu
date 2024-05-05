@@ -13,6 +13,7 @@ typedef unsigned int uint;
 #define MAX_THREADS_PER_BLOCK 1024
 #define MAX_BLOCKS 65535
 
+using namespace std;
 // Allocate device memory
 cudaError_t allocateDeviceMemory(uint** devicePtr, size_t size) {
     cudaError_t err = cudaMalloc((void**)devicePtr, size);
@@ -53,97 +54,153 @@ cudaError_t deallocateDeviceMemory(uint* devicePtr) {
     return err;
 }
 
-// Work-inefficient inclusive scan kernel
-__global__ void workInefficient_inclusiveScan(uint* input, uint* output, uint n) {
-    extern __shared__ uint shared[];
-    uint tid = threadIdx.x;
-    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void workEfficient_inclusiveScan(uint* input, uint* output, uint n, uint* blockSums) {
+    __shared__ uint shared[2*1024*sizeof(uint)];
+    int tid = threadIdx.x;
+    int bIdx = blockIdx.x;
+    int idx = bIdx * blockDim.x + tid;
 
     // Load input into shared memory
-    if (i < n) {
-        shared[tid] = input[i];
-    }
-    else {
-        shared[tid] = 0; // Pad with 0 for remaining threads
-    }
+    shared[tid] = (idx < n) ? input[idx] : 0;
     __syncthreads();
 
-    // Scan in place
-    for (uint stride = 1; stride < blockDim.x; stride *= 2) {
-        //uint index = tid + stride;
-        uint local_index;
-        if (tid >= stride) {
-            local_index = shared[tid - stride];
-        }
-        else {
-            local_index = 0;
-        }
-        __syncthreads();
-        shared[tid] = shared[tid] + local_index;
-    }
-    __syncthreads();
-
-    // Write output
-    if (i < n) {
-        output[i] = shared[tid];
-    }
-}
-
-// Work-efficient inclusive scan kernel
-__global__ void workEfficient_inclusiveScan(uint* input, uint* output, uint n) {
-    extern __shared__ uint shared[];
-    uint tid = threadIdx.x;
-    uint i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Load input into shared memory
-    if (i < n) {
-        shared[tid] = input[i];
-    }
-    else {
-        shared[tid] = 0; // Pad with 0 for remaining threads
-    }
-    __syncthreads();
-
-    if (i + blockDim.x < n) {
-
-        shared[tid + blockDim.x] = input[i + blockDim.x];
-
-    }
-
-    else {
-
-        shared[tid + blockDim.x] = 0; // Pad with 0 for remaining threads
-
-    }
-
-    // Reduction phase
-    for (uint stride = 1; stride <= blockDim.x; stride *= 2) {
-        uint index = 2 * stride * (tid + 1) - 1;
-        if (index < 2 * blockDim.x) {
+    // Up-sweep (Reduction) phase
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        int index = (tid + 1) * 2 * stride - 1;
+        if (index < blockDim.x) {
             shared[index] += shared[index - stride];
         }
         __syncthreads();
+        // Debug: Print shared memory state after each up-sweep step
+        /*
+        if (tid == 0) {
+            printf("Block %d - After up-sweep stride %d: ", blockIdx.x, stride);
+            for (int i = 0; i < blockDim.x; i++) {
+                printf("%u ", shared[i]);
+            }
+            printf("\n");
+        }
+        */
+        
     }
 
-    // Post-reduction reverse phase
-    for (uint stride = blockDim.x / 4; stride > 0; stride /= 2) {
-        __syncthreads();
-        uint index = 2 * stride * (tid + 1) - 1;
-        if (index + stride < 2 * blockDim.x) {
+    // Down-sweep phase
+    for (int stride = blockDim.x / 4; stride > 0;  stride /= 2) {
+        int index = 2 * stride * (tid + 1) - 1;
+        if (index + stride < blockDim.x) {
             shared[index + stride] += shared[index];
         }
         __syncthreads();
+        // Debug: Print shared memory state after each down-sweep step
+        /*
+        if (tid == 0) {
+            printf("Block %d - After down-sweep stride %d: ", blockIdx.x, stride);
+            for (int i = 0; i < blockDim.x; i++) {
+                printf("%u ", shared[i]);
+            }
+            printf("\n");
+        }
+        */
     }
 
-    // Write output
-    if (i < n) {
-        output[i] = shared[tid];
+    // Write the processed data back to the output
+    if (idx < n) {
+        output[idx] = shared[tid];
     }
 
-    if (i + blockDim.x < n) {
+    // Last thread writes the last element to blockSums
+    if (tid == blockDim.x - 1) {
+        blockSums[bIdx] = shared[blockDim.x - 1];
+    }
+}
 
-        output[i + blockDim.x] = shared[tid + blockDim.x];
+//////////////////////////////////////////////////////////////////////////////////////
+__global__ void scanBlockSums(uint* blockSums, int numBlocks) {
+    extern __shared__ uint temp[];
+    int tid = threadIdx.x;
+    // Load block sums into shared memory
+    if (tid < numBlocks) {
+        temp[tid] = blockSums[tid];
+    }
+    else {
+        temp[tid] = 0;
+    }
+    __syncthreads();
 
+    // Inclusive scan using up-sweep
+    for (unsigned int stride = 1; stride < numBlocks; stride *= 2) {
+        //__syncthreads();
+        int index = (tid + 1) * 2 * stride - 1;
+        if (index < numBlocks) {//blockDim.x
+            temp[index] += temp[index - stride];
+        }
+        __syncthreads();
+        /*
+        if (tid == 0) {
+            printf("After up sweep stride %d: ", stride);
+            for (int i = 0; i < numBlocks; i++) {
+                printf("%d ", temp[i]);
+            }
+            printf("\n");
+        }
+        */
+    }
+  
+    // Set the last element to zero to start the down-sweep
+    if (tid == numBlocks - 1) {
+        temp[numBlocks - 1] = 0;
+    }
+    __syncthreads();
+
+    // Down-Sweep
+    for (int stride = 1 << (31 - __clz(numBlocks - 1)); stride > 0; stride >>= 1) {
+        int index = (tid + 1) * 2 * stride - 1;
+        if (index + stride < numBlocks) {
+            temp[index + stride] += temp[index];
+        }
+        __syncthreads();
+        // Debug print after each stride
+        /*
+        if (tid == 0) {
+            printf("After down sweep stride %d: ", stride);
+            for (int i = 0; i < numBlocks; i++) {
+                printf("%d ", temp[i]);
+            }
+            printf("\n");
+        }
+        */
+    }
+    // Write back to the block sums
+    __syncthreads();
+
+    if (tid < numBlocks) {
+        blockSums[tid] = temp[tid];
+    }
+    //__syncthreads();
+    /*
+    // Correct the last element if numBlocks is not a power of two
+    if (tid == numBlocks - 1 && numBlocks & (numBlocks - 1)) {
+        blockSums[tid] = temp[tid - 1] + blockSums[tid - 1];
+    }
+    */
+}
+
+__global__ void addBlockSumsToOutput(uint* output, uint* blockSums, uint n, int numBlocks) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        uint before = output[idx];  // Store the current value before addition
+        if (blockIdx.x > 0) {
+            output[idx] += blockSums[blockIdx.x - 1];
+            /*
+            if(blockIdx.x > 5)
+            printf("Thread %d (Block %d, Index %d): Before = %u, BlockSum[%d] = %u, After = %u\n",
+                threadIdx.x, blockIdx.x, idx, before, blockIdx.x - 1, blockSums[blockIdx.x - 1], output[idx]);
+                */
+        }
+        else {
+            //printf("Thread %d (Block %d, Index %d): Initial Value = %u\n", threadIdx.x, blockIdx.x, idx, before);
+        }
     }
 }
 
@@ -157,14 +214,13 @@ void cpu_normal_inclusiveScan(uint* input, uint* output, uint n) {
 
 // Compare CPU and GPU results
 bool compareResults(uint* cpuOutput, uint* gpuOutput, uint n) {
-    /*
     for (uint i = 0; i < n; i++) {
         if (cpuOutput[i] != gpuOutput[i]) {
             printf("Mismatch at index %d: CPU=%d, GPU=%d\n", i, cpuOutput[i], gpuOutput[i]);
             return false;
         }
     }
-    */
+
     return true;
 }
 
@@ -175,8 +231,8 @@ int main(int argc, char** argv) {
     }
 
     uint n = atoi(argv[3]);
-    if (n > MAX_THREADS_PER_BLOCK * MAX_BLOCKS) {
-        fprintf(stderr, "Input size should be at most %d\n", MAX_THREADS_PER_BLOCK * MAX_BLOCKS);
+    if (n > 2* MAX_THREADS_PER_BLOCK * MAX_BLOCKS) {
+        fprintf(stderr, "Input size should be at most %d\n", 2*MAX_THREADS_PER_BLOCK * MAX_BLOCKS);
         exit(EXIT_FAILURE);
     }
 
@@ -211,21 +267,49 @@ int main(int argc, char** argv) {
 
     // Calculate the number of blocks and threads per block needed to process the entire input list
     int threadsPerBlock = maxThreadsPerBlock;
-    int numBlocks = (totalElements + threadsPerBlock - 1) / threadsPerBlock;
+    
+  
+    int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;  // Ensures all elements are covered
+    cout <<"Total Blocks : " << numBlocks << endl;
 
-    // Ensure that the number of blocks does not exceed the maximum
-    if (numBlocks > maxBlocks) {
-        numBlocks = maxBlocks;
-        threadsPerBlock = (totalElements + numBlocks - 1) / numBlocks;
-    }
-
+    uint* deviceBlockSums;
+    allocateDeviceMemory(&deviceBlockSums, numBlocks * sizeof(uint));
+    size_t sharedMemorySize = 2 * threadsPerBlock * sizeof(uint);
+    size_t sharedMemSize = numBlocks * sizeof(uint);
+    
+    // Declare a host array to store block sums from the device
+    uint* hostBlockSums = (uint*)malloc(numBlocks * sizeof(uint));
+    uint* hostBlockSums2 = (uint*)malloc(numBlocks * sizeof(uint));
     // Launch GPU kernel
     auto start_gpu = std::chrono::high_resolution_clock::now();
     if (strcmp(argv[1], "-work-inefficient") == 0) {
-        workInefficient_inclusiveScan << <numBlocks, threadsPerBlock, threadsPerBlock * sizeof(uint) >> > (deviceInput, deviceOutput, static_cast<uint>(totalElements));
+        //to be implemented later 
+        //workInefficient_inclusiveScan << <numBlocks, threadsPerBlock, threadsPerBlock * sizeof(uint) >> > (deviceInput, deviceOutput, static_cast<uint>(totalElements));
     }
     else if (strcmp(argv[1], "-work-efficient") == 0) {
-        workEfficient_inclusiveScan << <numBlocks, threadsPerBlock, 2 * threadsPerBlock * sizeof(uint) >> > (deviceInput, deviceOutput, static_cast<uint>(totalElements));
+        workEfficient_inclusiveScan <<< numBlocks, threadsPerBlock, sharedMemorySize >>> (deviceInput, deviceOutput, static_cast<uint>(totalElements), deviceBlockSums);
+        cudaDeviceSynchronize();
+        ///////////////////////////////////
+        // Copy block sums from device to host
+        //copyFromDevice(hostBlockSums, deviceBlockSums, numBlocks * sizeof(uint));
+        // Print block sums
+        //cout << "Block sums Work Efficient Kernel:" << endl;
+        //for (int i = 0; i < numBlocks; i++) {
+        //    cout << "Block " << i << ": " << hostBlockSums[i] << endl;
+        //}
+        //copyFromDevice(hostOutput, deviceOutput, n * sizeof(uint));
+        //cout << "Block sums Work Efficient Kernel:" << endl;
+        //for (int i = 0; i < totalElements; i++) {
+        //    cout << "Block " << i << ": " << hostOutput[i] << "  ";
+       // }
+        //cout << endl;
+
+        ///////////////////////////////////
+        scanBlockSums <<< 1, numBlocks, sharedMemSize >>> (deviceBlockSums, numBlocks); //numBlocks *sizeof(uint)
+        cudaDeviceSynchronize();
+        
+        addBlockSumsToOutput <<< numBlocks, MAX_THREADS_PER_BLOCK >>> (deviceOutput, deviceBlockSums, static_cast<uint>(totalElements), numBlocks);
+        cudaDeviceSynchronize();
     }
     else {
         fprintf(stderr, "Invalid kernel type. Choose either 'scan-work-efficient' or 'scan-work-inefficient'.\n");
@@ -237,8 +321,10 @@ int main(int argc, char** argv) {
     printf("GPU execution time: %.3f ms\n", duration_gpu.count());
 
     // Copy output data from device
+    cout << "kernel run successful" << endl;
     copyFromDevice(hostOutput, deviceOutput, n * sizeof(uint));
-
+    cout << "Copy run successful" << endl;
+    
     // Run CPU implementation
     auto start_cpu = std::chrono::high_resolution_clock::now();
     cpu_normal_inclusiveScan(hostInput, cpuOutput, n);
@@ -249,10 +335,10 @@ int main(int argc, char** argv) {
     // Compare results
     bool matched = compareResults(cpuOutput, hostOutput, n);
     if (matched) {
-        //printf("CPU and GPU results match.\n");
+        printf("CPU and GPU results match.\n");
     }
     else {
-        //printf("CPU and GPU results do not match.\n");
+        printf("CPU and GPU results do not match.\n");
     }
 
     // Deallocate memory
@@ -261,6 +347,6 @@ int main(int argc, char** argv) {
     free(cpuOutput);
     deallocateDeviceMemory(deviceInput);
     deallocateDeviceMemory(deviceOutput);
-
+    deallocateDeviceMemory(deviceBlockSums);
     return 0;
 }
