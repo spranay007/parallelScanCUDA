@@ -21,7 +21,7 @@ using namespace std;
 // Define utility function to check CUDA errors
 void checkCudaError(cudaError_t result, char const* const func, const char* const file, int const line) {
     if (result != cudaSuccess) {
-        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
+            cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
             file << ":" << line << " '" << func << "' \n" <<
             "CUDA error message = " << cudaGetErrorString(result) << "\n";
         exit(1);
@@ -364,7 +364,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     float milliseconds = 0;
-    if (strcmp(argv[1], "-work-inefficient") == 0) {
+    if (strcmp(argv[1], "scan-work-inefficient") == 0) {
         // Start recording
         CUDA_CHECK(cudaEventRecord(start, 0));
         workInefficient_inclusiveScan <<<numBlocks, threadsPerBlock, 4*threadsPerBlock * sizeof(uint) >>> (deviceInput, deviceOutput, n, deviceBlockSums);
@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
         float gflops = calculateGflops(operations, milliseconds);
         cout << "GPU execution time: " << milliseconds << " ms, GFLOPS: " << gflops << endl;
     }
-    else if (strcmp(argv[1], "-work-efficient") == 0) {
+    else if (strcmp(argv[1], "scan-work-efficient") == 0) {
         // Start recording
         CUDA_CHECK(cudaEventRecord(start, 0));
         // Launch work-efficient scan

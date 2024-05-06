@@ -1,9 +1,7 @@
-# projectThree.cpp
-# convolutionTexture.cu
-# convolutionTexture_common.h
-# convolutionTexture_gold.cpp
+# ParallelScan.cu
 
-The goal of this project is to implement a convolution routine using texture and shared memory in CUDA
+The goal of this project is to implement a kernel to perform an inclusive parallel scan on a 1D list (with randomly
+generated integers) using both the work-efficient and work-inefficient algorithms in CUDA
 
 ## Platform
 Project created on Windows X64
@@ -18,16 +16,16 @@ Visual Studio 2022
 
 ## Usage
 Sample command to create 
-Image Height: 3072
-Image Width: 3072
-Kernel Length: 18
+Sample userinput size: 9999
 ******************************************
 ```bash
 cd .\x64\
 cd .\Debug\
 
 # Now in the Debug directory
-./Project_three -i 3072 -j 3072 -k 18
+ .\ParallelScan.exe scan-work-inefficient -i 9999
+ or
+  .\ParallelScan.exe scan-work-efficient -i 9999
 ```
 ******************************************
 ## NOTE
