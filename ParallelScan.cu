@@ -4,9 +4,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
-
-// CUDA runtime
 #include <cuda_runtime.h>
+
 
 typedef unsigned int uint;
 
@@ -15,7 +14,20 @@ typedef unsigned int uint;
 
 using namespace std;
 
-// Utility functions
+
+#define CUDA_CHECK(val) checkCudaError((val), #val, __FILE__, __LINE__)
+
+////////////////////////////////////////////////////////////////////////////////////////////
+// Define utility function to check CUDA errors
+void checkCudaError(cudaError_t result, char const* const func, const char* const file, int const line) {
+    if (result != cudaSuccess) {
+        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
+            file << ":" << line << " '" << func << "' \n" <<
+            "CUDA error message = " << cudaGetErrorString(result) << "\n";
+        exit(1);
+    }
+}
+////////////////////////////////////////////////////////////////////////////////////////////
 cudaError_t allocateDeviceMemory(uint** devicePtr, size_t size) {
     cudaError_t err = cudaMalloc((void**)devicePtr, size);
     if (err != cudaSuccess) {
@@ -24,7 +36,7 @@ cudaError_t allocateDeviceMemory(uint** devicePtr, size_t size) {
     }
     return err;
 }
-
+////////////////////////////////////////////////////////////////////////////////////////////
 cudaError_t copyToDevice(uint* devicePtr, const uint* hostPtr, size_t size) {
     cudaError_t err = cudaMemcpy(devicePtr, hostPtr, size, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -33,7 +45,7 @@ cudaError_t copyToDevice(uint* devicePtr, const uint* hostPtr, size_t size) {
     }
     return err;
 }
-
+////////////////////////////////////////////////////////////////////////////////////////////
 cudaError_t copyFromDevice(uint* hostPtr, const uint* devicePtr, size_t size) {
     cudaError_t err = cudaMemcpy(hostPtr, devicePtr, size, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
@@ -42,7 +54,7 @@ cudaError_t copyFromDevice(uint* hostPtr, const uint* devicePtr, size_t size) {
     }
     return err;
 }
-
+////////////////////////////////////////////////////////////////////////////////////////////
 cudaError_t deallocateDeviceMemory(uint* devicePtr) {
     cudaError_t err = cudaFree(devicePtr);
     if (err != cudaSuccess) {
@@ -51,7 +63,45 @@ cudaError_t deallocateDeviceMemory(uint* devicePtr) {
     }
     return err;
 }
+////////////////////////////////////////////////////////////////////////////////////////////
+// Work-inefficient inclusive scan kernel
+__global__ void workInefficient_inclusiveScan(uint* input, uint* output, uint n, uint* blockSums) {
+    extern __shared__ uint shared[];
+    int tid = threadIdx.x;
+    int globalIndex = blockIdx.x * blockDim.x + tid;
 
+    // Load input into shared memory, handling out-of-range indices
+    if (globalIndex < n) {
+        shared[tid] = input[globalIndex];
+    }
+    else {
+        shared[tid] = 0; // Padding with zero
+    }
+    __syncthreads();
+
+    // Perform a simple inclusive scan using shared memory
+    for (uint stride = 1; stride < blockDim.x; stride *= 2) {
+        uint temp = 0;
+        if (tid >= stride) {
+            temp = shared[tid - stride];
+        }
+        __syncthreads();
+        shared[tid] += temp;
+        __syncthreads();
+    }
+
+    // Write the results back to the output array
+    if (globalIndex < n) {
+        output[globalIndex] = shared[tid];
+    }
+
+    // Last thread in the block writes the block's sum to the blockSums array
+    if (tid == blockDim.x - 1) {
+        blockSums[blockIdx.x] = shared[blockDim.x - 1];
+    }
+}
+ ////////////////////////////////////////////////////////////////////////////////////////////
+// Work-efficient inclusive scan kernel
 __global__ void workEfficient_inclusiveScan(uint* input, uint* output, uint n, uint* blockSums) {
     __shared__ uint shared[2 * 1024 * sizeof(uint)];
     int tid = threadIdx.x;
@@ -92,7 +142,7 @@ __global__ void workEfficient_inclusiveScan(uint* input, uint* output, uint n, u
 }
 
 //////////////////////////////////////////////////////////////////////////////////////
-__global__ void scanBlockSumsVanila(uint* blockSums, int numBlocks) {
+__global__ void scanBlockSumsWithoutRec(uint* blockSums, int numBlocks) {
     extern __shared__ uint temp[];
     int tid = threadIdx.x;
     // Load block sums into shared memory
@@ -154,57 +204,8 @@ __global__ void scanBlockSumsVanila(uint* blockSums, int numBlocks) {
         blockSums[tid] = temp[tid];
     }
     //__syncthreads();
-    /*
-    // Correct the last element if numBlocks is not a power of two
-    if (tid == numBlocks - 1 && numBlocks & (numBlocks - 1)) {
-        blockSums[tid] = temp[tid - 1] + blockSums[tid - 1];
-    }
-    */
 }
 ////////////////////////////////////////////////////////////////////////////////////////////
-__global__ void scanBlockSums(uint* blockSums, uint* blockSumsNext, int numBlocks) {
-    extern __shared__ uint temp[];
-    int tid = threadIdx.x;
-
-    // Load block sums into shared memory
-    if (tid < numBlocks) {
-        temp[tid] = blockSums[tid];
-    }
-    else {
-        temp[tid] = 0;
-    }
-    __syncthreads();
-
-    // Inclusive scan using up-sweep
-    for (unsigned int stride = 1; stride < numBlocks; stride *= 2) {
-        int index = (tid + 1) * 2 * stride - 1;
-        if (index < numBlocks) {
-            temp[index] += temp[index - stride];
-        }
-        __syncthreads();
-    }
-
-    // Set the last element to zero to start the down-sweep
-    if (tid == numBlocks - 1) {
-        temp[numBlocks - 1] = 0;
-    }
-    __syncthreads();
-
-    // Down-Sweep
-    for (int stride = 1 << (31 - __clz(numBlocks - 1)); stride > 0; stride >>= 1) {
-        int index = (tid + 1) * 2 * stride - 1;
-        if (index + stride < numBlocks) {
-            temp[index + stride] += temp[index];
-        }
-        __syncthreads();
-    }
-
-    // Write back to the block sums
-    if (tid < numBlocks) {
-        blockSumsNext[tid] = temp[tid];
-    }
-}
-
 __global__ void addBlockSumsToOutput(uint* output, uint* blockSums, uint n, int numBlocks) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -214,6 +215,7 @@ __global__ void addBlockSumsToOutput(uint* output, uint* blockSums, uint n, int 
         }
     }
 }
+////////////////////////////////////////////////////////////////////////////////////////////
 __global__ void scanBlockSumsVanilla(uint* blockSums, int numBlocks) {
     extern __shared__ uint temp[];
     int tid = threadIdx.x;
@@ -249,8 +251,7 @@ __global__ void scanBlockSumsVanilla(uint* blockSums, int numBlocks) {
         blockSums[index] = temp[tid];
     }
 }
-
-
+//////////////////////////////////////////////////////////////////////////////////////
 // Improved recursive function with enhanced error handling
 cudaError_t recursiveScanBlockSums(uint* blockSums, int numBlocks, uint* tempBuffer = nullptr) {
     bool isRootCall = (tempBuffer == nullptr);
@@ -270,7 +271,7 @@ cudaError_t recursiveScanBlockSums(uint* blockSums, int numBlocks, uint* tempBuf
         int blocks = (numBlocks + threads - 1) / threads;
         uint* blockSumsNext = tempBuffer;
 
-        scanBlockSumsVanilla << <blocks, threads, threads * sizeof(uint) >> > (blockSums, numBlocks);
+        scanBlockSumsVanilla <<<blocks, threads, threads * sizeof(uint) >>> (blockSums, numBlocks);
         cudaStatus = cudaGetLastError();
         if (cudaStatus != cudaSuccess) {
             fprintf(stderr, "CUDA Kernel error: %s\n", cudaGetErrorString(cudaStatus));
@@ -296,9 +297,7 @@ cudaError_t recursiveScanBlockSums(uint* blockSums, int numBlocks, uint* tempBuf
 
     return cudaSuccess;
 }
-
-
-
+//////////////////////////////////////////////////////////////////////////////////////
 // CPU implementation of normal inclusive scan
 void cpu_normal_inclusiveScan(uint* input, uint* output, uint n) {
     output[0] = input[0];
@@ -306,7 +305,7 @@ void cpu_normal_inclusiveScan(uint* input, uint* output, uint n) {
         output[i] = output[i - 1] + input[i];
     }
 }
-
+//////////////////////////////////////////////////////////////////////////////////////
 // Compare CPU and GPU results
 bool compareResults(uint* cpuOutput, uint* gpuOutput, uint n) {
     for (uint i = 0; i < n; i++) {
@@ -318,7 +317,11 @@ bool compareResults(uint* cpuOutput, uint* gpuOutput, uint n) {
 
     return true;
 }
-
+//////////////////////////////////////////////////////////////////////////////////////
+float calculateGflops(int operations, float milliseconds) {
+    return (operations / (milliseconds / 1000.0f)) / 1e9f; // Convert to seconds and then to Giga
+}
+//////////////////////////////////////////////////////////////////////////////////////
 int main(int argc, char** argv) {
     if (argc != 4 || (strcmp(argv[2], "-i") != 0)) {
         fprintf(stderr, "Usage: %s [scan-work-efficient | scan-work-inefficient] -i <vector_size>\n", argv[0]);
@@ -341,7 +344,7 @@ int main(int argc, char** argv) {
     // Initialize input data
     srand(time(NULL));
     for (uint i = 0; i < n; i++) {
-        hostInput[i] = 1; // Simple input to demonstrate inclusive scan
+        hostInput[i] = rand() % 100;//1; // Simple input to demonstrate inclusive scan
     }
 
     // Allocate device memory
@@ -354,26 +357,73 @@ int main(int argc, char** argv) {
     int threadsPerBlock = MAX_THREADS_PER_BLOCK;
     int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
     allocateDeviceMemory(&deviceBlockSums, numBlocks * sizeof(uint));
-
-    // Launch work-efficient scan
-    workEfficient_inclusiveScan << <numBlocks, threadsPerBlock >> > (deviceInput, deviceOutput, n, deviceBlockSums);
-    cudaDeviceSynchronize();
-
-    // Handle block sums recursively
-    recursiveScanBlockSums(deviceBlockSums, numBlocks, nullptr);
-    //scanBlockSumsVanila << < 1, numBlocks, numBlocks * sizeof(uint) >> > (deviceBlockSums, numBlocks);
-    cudaDeviceSynchronize();
-    // Add block sums back to the output
-    addBlockSumsToOutput << <numBlocks, threadsPerBlock >> > (deviceOutput, deviceBlockSums, n, numBlocks);
-    cudaDeviceSynchronize();
-
+    uint* hostBlockSums = (uint*)malloc(numBlocks * sizeof(uint));
     // Timing GPU execution
-    auto start_gpu = chrono::high_resolution_clock::now();
+    // Initialize CUDA events
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float milliseconds = 0;
+    if (strcmp(argv[1], "-work-inefficient") == 0) {
+        // Start recording
+        CUDA_CHECK(cudaEventRecord(start, 0));
+        workInefficient_inclusiveScan <<<numBlocks, threadsPerBlock, 4*threadsPerBlock * sizeof(uint) >>> (deviceInput, deviceOutput, n, deviceBlockSums);
+        cudaDeviceSynchronize();
+        //scanBlockSumsWithoutRec <<< 1, numBlocks, numBlocks * sizeof(uint) >>> (deviceBlockSums, numBlocks);
+        // Handle block sums recursively
+        recursiveScanBlockSums(deviceBlockSums, numBlocks, nullptr);
+        cudaDeviceSynchronize();
+        // Add block sums back to the output
+        addBlockSumsToOutput <<<numBlocks, threadsPerBlock >>> (deviceOutput, deviceBlockSums, n, numBlocks);
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        int operations = numBlocks * threadsPerBlock * (threadsPerBlock - 1);  // For work-inefficient
+        cout << "Number of operations in work in-efficient: " << operations << endl;
+        cout << "Number of numBlocks in work in-efficient: " << numBlocks << endl;
+        float gflops = calculateGflops(operations, milliseconds);
+        cout << "GPU execution time: " << milliseconds << " ms, GFLOPS: " << gflops << endl;
+    }
+    else if (strcmp(argv[1], "-work-efficient") == 0) {
+        // Start recording
+        CUDA_CHECK(cudaEventRecord(start, 0));
+        // Launch work-efficient scan
+        workEfficient_inclusiveScan <<<numBlocks, threadsPerBlock >>> (deviceInput, deviceOutput, n, deviceBlockSums);
+        cudaDeviceSynchronize();
+
+        // Handle block sums recursively
+        recursiveScanBlockSums(deviceBlockSums, numBlocks, nullptr);
+        //scanBlockSumsWithoutRec <<< 1, numBlocks, 2*numBlocks * sizeof(uint) >>> (deviceBlockSums, numBlocks);
+        cudaDeviceSynchronize();
+
+        // Add block sums back to the output
+        addBlockSumsToOutput <<<numBlocks, threadsPerBlock >>> (deviceOutput, deviceBlockSums, n, numBlocks);
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        int operations = numBlocks * 2 * (threadsPerBlock - 1);  // For work-efficient
+        cout <<"Number of operations in work efficient: " << operations << endl;
+        cout << "Number of numBlocks in work in-efficient: " << numBlocks << endl;
+        float gflops = calculateGflops(operations, milliseconds);
+        cout << "GPU execution time: " << milliseconds << " ms, GFLOPS: " << gflops << endl;
+
+    }
+    else {
+        fprintf(stderr, "Invalid kernel type. Choose either 'scan-work-efficient' or 'scan-work-inefficient'.\n");
+        exit(EXIT_FAILURE);
+    }
+   
+    
+    // Calculate elapsed time
+    cout << "GPU execution time: " << milliseconds << " ms\n";
+
+    // Clean up
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
     // Copy output data from device
     copyFromDevice(hostOutput, deviceOutput, n * sizeof(uint));
-    auto end_gpu = chrono::high_resolution_clock::now();
-    chrono::duration<double, milli> duration_gpu = end_gpu - start_gpu;
-    printf("GPU execution time: %.3f ms\n", duration_gpu.count());
 
     // CPU inclusive scan for comparison
     auto start_cpu = chrono::high_resolution_clock::now();
